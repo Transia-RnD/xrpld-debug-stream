@@ -1,0 +1,29 @@
+---
+config_path: /Users/darkmatter/projects/ledger-works/xrpld-debug-stream/batch-devnet/node/config/
+docker_container_name: vnode1
+docker_container_ports:
+- 5017:5017
+- 5015:5015
+- 6018:6018
+- 6016:6016
+- 2459:2459
+docker_env_variables:
+  PEER: '2459'
+  RPC_ADMIN: '5015'
+  RPC_PUBLIC: '5017'
+  WS_ADMIN: '6016'
+  WS_PUBLIC: '6018'
+docker_image_name: transia/cluster:3f954dd8ba7a8d5fbe1cb2a4981c3643cf84a5a2
+docker_volumes:
+- /opt/ripple/config:/opt/ripple/config
+- /opt/ripple/log:/opt/ripple/log
+- /opt/ripple/lib:/opt/ripple/lib
+- /var/lib/rippled/db:/var/lib/rippled/db
+peer_port: 2459
+ssh_port: '1988'
+volumes:
+- /opt/ripple/config
+- /opt/ripple/log
+- /opt/ripple/lib
+- /var/lib/rippled/db
+ws_port: 6018

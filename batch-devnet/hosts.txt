@@ -1,0 +1,6 @@
+
+# this is a basic file putting different hosts into categories
+# used by ansible to determine which actions to run on which hosts
+[all]
+    
+79.110.60.99 ansible_port=1988 ansible_user=root ansible_ssh_private_key_file=~/.ssh/xrpl-labs vars_file=host_vars/79.110.60.99.yml 

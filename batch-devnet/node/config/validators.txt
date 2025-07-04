@@ -1,0 +1,5 @@
+[validator_list_sites]
+    https://vl.devnet.rippletest.net
+
+[validator_list_keys]
+    EDBB54B0D9AEE071BB37784AF5A9E7CC49AC7A0EFCE868C54532BCB966B9CFC13B
