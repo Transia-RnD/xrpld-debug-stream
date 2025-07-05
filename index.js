@@ -7,7 +7,6 @@ const bodyParser = require('body-parser')
 const cors = require('cors')
 const helmet = require('helmet')
 const morganDebug = require('morgan-debug')
-const addressCodec = require('ripple-address-codec')
 const W3CWebSocket = require('websocket').w3cwebsocket
 
 let upstreamMessageCount = 0
@@ -27,15 +26,15 @@ redis.on('ready', _ => log_redis('REDIS ready'))
 redis.on('close', _ => log_redis('REDIS disconnected'))
 redis.on('error', e => log_redis('Error', e))
 
-const tempStoreMsg = (account, message) => {
+const tempStoreMsg = (batchHash, message) => {
   try {
-    const key = account + '_' + new Date() / 1 + '_' + upstreamMessageCount
+    const key = batchHash + '_' + new Date() / 1 + '_' + upstreamMessageCount
     const exp = 60 * 30 // 60 seconds times 30 minutes
 
     // log_redis('set', key)
     redis.set('msg:' + key, message, 'ex', exp)
-    redis.incr('acc:' + account)
-    redis.expire('acc:' + account, exp)
+    redis.incr('batch:' + batchHash)
+    redis.expire('batch:' + batchHash, exp)
   } catch (e) {
     log_redis('Error', e)
   }
@@ -46,19 +45,22 @@ const streamClientMessage = msg => {
     if (msg.match(/reportConsensusStateChange/)) return
 
     upstreamMessageCount++
-    const rAddrMatch = msg.match(/r[a-zA-Z0-9]{20,}/g)
+    const batchTraceMatch = msg.match(/BatchTrace\[([A-F0-9]{64})\]/g)
 
-    if (rAddrMatch) {
-      const uniqueAccounts = [...new Set(rAddrMatch)]
+    if (batchTraceMatch) {
+      const uniqueBatches = [...new Set(batchTraceMatch.map(match => {
+        const hashMatch = match.match(/BatchTrace\[([A-F0-9]{64})\]/)
+        return hashMatch ? hashMatch[1] : null
+      }).filter(Boolean))]
 
-      log('MSG for', uniqueAccounts.join(', '))
-      uniqueAccounts.forEach(r => {
-        tempStoreMsg(r, msg)
+      log('MSG for batches', uniqueBatches.join(', '))
+      uniqueBatches.forEach(batchHash => {
+        tempStoreMsg(batchHash, msg)
 
         expressWs.getWss().clients.forEach(c => {
-          if (c?.xrplAccount === r) {
+          if (c?.subscriptionType === 'batch' && (!c?.batchHash || c?.batchHash === batchHash)) {
             c.send(msg)
-            c.xrplMessages++
+            c.batchMessages++
           }
         })
       })
@@ -160,23 +162,54 @@ app.use(cors({
   // methods: 'GET, POST, OPTIONS'
 }))
 
-app.ws('/:account(r[a-zA-Z0-9]{20,})', (ws, req) => {
+// WebSocket endpoint for all batch transactions
+app.ws('/batch', (ws, req) => {
   try {
-    const xrplAccount = (req.params?.account || '').trim()
-
-    if (!addressCodec.isValidClassicAddress(xrplAccount)) {
-      throw new Error('Invalid XRPL account address: ' + xrplAccount)
-    }
-
-    log('WebSocket connection', xrplAccount)
+    log('WebSocket connection for all batch transactions')
   
     Object.assign(ws, {
-      xrplAccount,
-      xrplMessages: 0
+      subscriptionType: 'batch',
+      batchHash: null, // null means listen to all batches
+      batchMessages: 0
     })
 
     ws.on('message', () => {
-      ws.send(xrplAccount)
+      ws.send('batch_all')
+    })
+
+  } catch (e) {
+    ws.send(JSON.stringify({
+      msg: e.message,
+      error: true
+    }))
+
+    log(e.message)
+
+    process.nextTick(() => {
+      ws.close(4000, e.message)
+    })
+  }
+})
+
+// WebSocket endpoint for specific batch hash
+app.ws('/batch/:hash([A-F0-9]{64})', (ws, req) => {
+  try {
+    const batchHash = (req.params?.hash || '').trim().toUpperCase()
+
+    if (!batchHash.match(/^[A-F0-9]{64}$/)) {
+      throw new Error('Invalid batch hash: ' + batchHash)
+    }
+
+    log('WebSocket connection for batch', batchHash)
+  
+    Object.assign(ws, {
+      subscriptionType: 'batch',
+      batchHash,
+      batchMessages: 0
+    })
+
+    ws.on('message', () => {
+      ws.send(batchHash)
     })
 
   } catch (e) {
@@ -195,19 +228,20 @@ app.ws('/:account(r[a-zA-Z0-9]{20,})', (ws, req) => {
 
 app.get('/', async (req, res) => {
   res.status(404).json({
-    msg: 'Connect using a WebSocket client & provide an XRPL account address as path',
+    msg: 'Connect using a WebSocket client to /batch for all batch transactions or /batch/{hash} for specific batch',
     error: true
   })
 })
 
-app.get('/recent/accounts', async (req, res) => {
+app.get('/recent/batches', async (req, res) => {
   return res.json({
-    accounts: (await redis.keys('acc:*')).map(k => k.slice(4))
+    batches: (await redis.keys('batch:*')).map(k => k.slice(6))
   })
 })
 
-app.get('/recent/:account(r[a-zA-Z0-9]{18,})', async (req, res) => {
-  const logs = (await Promise.all((await redis.keys('msg:' + req.params.account + '_*'))
+app.get('/recent/batch/:hash([A-F0-9]{64})', async (req, res) => {
+  const batchHash = req.params.hash.toUpperCase()
+  const logs = (await Promise.all((await redis.keys('msg:' + batchHash + '_*'))
     .map(async l => {
       const m = l.slice(4).split('_')
       return {
@@ -220,8 +254,8 @@ app.get('/recent/:account(r[a-zA-Z0-9]{18,})', async (req, res) => {
     }, {})
 
   return res.json({
-    account: req.params.account,
-    messages: Number(await redis.get('acc:' + req.params.account) || 0),
+    batch: batchHash,
+    messages: Number(await redis.get('batch:' + batchHash) || 0),
     logs: Object.keys(logs).sort().reduce((a, b) => {
       a[b] = logs[b]
       return a
@@ -234,16 +268,18 @@ app.get('/status', async (req, res) => {
     upstreamMessages: upstreamMessageCount,
     upstreamConnections: upstreamConnectCount,
     connections: expressWs.getWss().clients.size,
-    accounts: [ ...expressWs.getWss().clients.values() ].map(c => {
+    subscriptions: [ ...expressWs.getWss().clients.values() ].map(c => {
       return {
-        account: c?.xrplAccount,
-        messages: c?.xrplMessages || 0
+        type: c?.subscriptionType,
+        batch: c?.batchHash || 'all',
+        messages: c?.batchMessages || 0
       }
     }).reduce((a, b) => {
+      const key = b.type + '_' + b.batch
       Object.assign(a, {
-        [b.account]: {
-          messages: (a[b.account]?.messages || 0) + b.messages,
-          connections: (a[b.account]?.connections || 0) + 1
+        [key]: {
+          messages: (a[key]?.messages || 0) + b.messages,
+          connections: (a[key]?.connections || 0) + 1
         }
       })
       return a
@@ -251,14 +287,17 @@ app.get('/status', async (req, res) => {
   })
 })
 
-app.get('/:account(r[a-zA-Z0-9]{20,})', 
+app.get('/batch', 
   (req, res, next) => {
     req.url = '/'
-    if (!addressCodec.isValidClassicAddress(req.params?.account || '')) {
-      next('route')
-    } else {
-      next()
-    }
+    next()
+  },
+  express.static(__dirname + '/public', { index: 'client.html' }))
+
+app.get('/batch/:hash([A-F0-9]{64})', 
+  (req, res, next) => {
+    req.url = '/'
+    next()
   },
   express.static(__dirname + '/public', { index: 'client.html' }))
 
