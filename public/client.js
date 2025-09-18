@@ -1,47 +1,34 @@
-var batchHash = null
-var endpoint = null
+var account = document.location.pathname.replace(/^[^a-zA-Z0-9]+/g, '').split('/')[0]
+var endpoint = 'ws' + document.location.origin.slice(4) + '/' + account
 var reconnect = 1
 var reconnectTimer
 
-document.getElementById('batch-info').innerText = 'All Batch Transactions'
-console.log('Debug Stream WebSocket for Batch Transactions')
+document.getElementById('account').innerText = account
+console.log('Debug Stream WebSocket', { account, endpoint })
 
 document.getElementById('connected').style.display = 'none'
 
 var stopped = false
 var socket
-var msgid = 0
+var msgid
 var messages = []
-var messageCount = 0
 
-function updateBatchInfo() {
-  const batchInfoEl = document.getElementById('batch-info')
-  if (batchHash) {
-    batchInfoEl.innerText = `Batch: ${batchHash}`
-  } else {
-    batchInfoEl.innerText = 'All Batch Transactions'
-  }
-}
-
-function reveal(messageid) {
+function reveal (messageid) {
   var el = document.getElementById('msg_' + messageid)
   el.innerHTML = ''
   var message = {
-    data: messages[messageid - 1]
+    data: messages[messageid - 1].replace(new RegExp('(' + account + ')', 'g') , '<u class="fw-bold text-primary">$1</u>')
   }
 
-  // Highlight batch hashes in the message
-  var highlightedData = message.data.replace(/BatchTrace\[([A-F0-9]{64})\]/g, '<u class="fw-bold text-success">BatchTrace[$1]</u>')
-
   if (message.data.match(/^[0-9]{4}-[a-z]{3}-[0-9]{2} /i)) {
-    el.innerHTML += '<small class="text-muted">' + highlightedData.slice(0, 34) + '</small> ' + highlightedData.slice(34)
+    el.innerHTML += '<small class="text-muted">' + message.data.slice(0, 34) + '</small> ' + message.data.slice(34)
   } else {
-    el.innerHTML += highlightedData
+    el.innerHTML += message.data
   }
 }
 
-function connection() {
-  if (stopped || !endpoint) return
+function connection () {
+  if (stopped) return
   reconnect++
 
   try {
@@ -73,7 +60,7 @@ function connection() {
     reconnect = 1
     clearTimeout(connectionTimeout)
     clearTimeout(reconnectTimer)
-    console.log('Connected to batch stream!', batchHash || 'all batches')
+    console.log('Open!', account)
   } 
   
   socket.onclose = function () {
@@ -83,35 +70,31 @@ function connection() {
     if (reconnect > 10) {
       reconnect = 10
     }
-    console.log('Disconnected from batch stream', batchHash || 'all batches', 'try to reconnect in', reconnect, 'sec')
+    console.log('Close!', account, 'try to reconnect in', reconnect, 'sec')
     reconnectTimer = setTimeout(function () {
       window.dispatchEvent(new Event('reconnectws'))
     }, reconnect * 1000)
   }
 
   socket.onmessage = function (message) {
-    // Skip ping responses
-    if (message.data.trim() === 'batch_all' || (batchHash && message.data.trim() === batchHash)) {
+    if (message.data.trim() === account.trim()) {
       return
     }
 
     document.getElementById('connected').style.display = 'none'
     document.getElementById('connecting').style.display = 'none'
 
-    console.log('Batch message received:', message)
+    console.log(account, message)
     try {
       var json = JSON.parse(message.data)
       if (json.error) {
         stopped = true
         console.log('Stopped, error', json)
         socket.close()
-        return
       }
     } catch (e) {}
 
     msgid = messages.push(message.data)
-    messageCount++
-    document.getElementById('message-count').innerText = messageCount
 
     var el = document.createElement('pre')
     el.setAttribute('id', 'msg_' + msgid)
@@ -119,24 +102,21 @@ function connection() {
     el.style.whiteSpace = 'pre-wrap'
 
     el.innerHTML = ''
-    var remainingMessage = message.data
-    if (remainingMessage.match(/^[0-9]{4}-[a-z]{3}-[0-9]{2} /i)) {
-      el.innerHTML += '<small class="text-muted">' + remainingMessage.slice(0, 34) + '</small> '
-      remainingMessage = message.data.slice(34)
+    var remaningMessage = message.data
+    if (remaningMessage.match(/^[0-9]{4}-[a-z]{3}-[0-9]{2} /i)) {
+      el.innerHTML += '<small class="text-muted">' + remaningMessage.slice(0, 34) + '</small> '
+      remaningMessage = message.data.slice(34)
     }
 
-    if (remainingMessage.length > 350 || remainingMessage.split("\n").length > 5) {
+    if (remaningMessage.length > 350 || remaningMessage.split("\n").length > 5) {
       var trunc
-      if (remainingMessage.split("\n").length > 6) {
-        trunc = remainingMessage.split("\n").slice(0, 6).join("\n")
+      if (remaningMessage.split("\n").length > 6) {
+        trunc = remaningMessage.split("\n").slice(0, 6).join("\n")
       } else {
-        trunc = remainingMessage.slice(0, 350)
+        trunc = remaningMessage.slice(0, 350)
       }
 
-      // Highlight batch hashes
-      var highlightedTrunc = trunc.replace(/BatchTrace\[([A-F0-9]{64})\]/g, '<u class="fw-bold text-success">BatchTrace[$1]</u>')
-      el.innerHTML += highlightedTrunc + '<br />'
-      
+      el.innerHTML += trunc.replace(new RegExp('(' + account + ')', 'g') , '<u class="fw-bold text-primary">$1</u>') + '<br />'
       var elb = document.createElement('button')
       elb.innerHTML = '... (Read more)'
       elb.setAttribute('msgid', msgid)
@@ -146,69 +126,14 @@ function connection() {
       }
       el.appendChild(elb)
     } else {
-      // Highlight batch hashes
-      var highlightedMessage = remainingMessage.replace(/BatchTrace\[([A-F0-9]{64})\]/g, '<u class="fw-bold text-success">BatchTrace[$1]</u>')
-      el.innerHTML += highlightedMessage
+      el.innerHTML += remaningMessage.replace(new RegExp('(' + account + ')', 'g') , '<u class="fw-bold text-primary">$1</u>')
     }
 
     el.setAttribute('class', 'list-item text-dark py-1 border border-light shadow-sm mb-3 px-2 rounded ')
     document.getElementById('list').appendChild(el)
-    
-    // Auto-scroll to bottom
-    window.scrollTo(0, document.body.scrollHeight)
   }  
 }
 
-function connect() {
-  const hashInput = document.getElementById('batch-hash').value.trim().toUpperCase()
-  
-  if (hashInput && !hashInput.match(/^[A-F0-9]{64}$/)) {
-    alert('Invalid batch hash. Please enter a 64-character hexadecimal string or leave empty for all batches.')
-    return
-  }
-  
-  batchHash = hashInput || null
-  
-  if (batchHash) {
-    endpoint = `ws://79.110.60.99:8080/batch/${batchHash}`
-  } else {
-    endpoint = `ws://79.110.60.99:8080/batch`
-  }
-  
-  updateBatchInfo()
-  
-  console.log('Connecting to batch stream:', { batchHash, endpoint })
-  
-  stopped = false
-  connection()
-}
-
-function disconnect() {
-  stopped = true
-  try {
-    socket.close()
-  } catch (e) {}
-  
-  document.getElementById('connected').style.display = 'none'
-  document.getElementById('connecting').style.display = 'none'
-  document.getElementById('ready').style.display = 'block'
-  document.getElementById('connect-btn').style.display = 'inline-block'
-  document.getElementById('disconnect-btn').style.display = 'none'
-  
-  clearTimeout(reconnectTimer)
-}
-
-document.getElementById('connect-btn').onclick = connect
-document.getElementById('disconnect-btn').onclick = disconnect
-
-// Allow Enter key to connect
-document.getElementById('batch-hash').addEventListener('keypress', function(e) {
-  if (e.key === 'Enter') {
-    connect()
-  }
-})
-
 window.addEventListener('reconnectws', connection)
 
-// Auto-focus on hash input
-document.getElementById('batch-hash').focus()
+connection()
