@@ -1,5 +1,5 @@
-var account = document.location.pathname.replace(/^[^a-zA-Z0-9]+/g, '').split('/')[0]
-var endpoint = 'ws' + document.location.origin.slice(4) + '/' + account
+var account = 'rn6CYo6uSxR6fP7jWg3c8SL5jrqTc2GjCS'
+var endpoint = 'wss://xahau-test.net/debugstream' + '/' + account
 var reconnect = 1
 var reconnectTimer
 
