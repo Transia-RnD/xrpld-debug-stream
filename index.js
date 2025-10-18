@@ -8,6 +8,7 @@ const cors = require('cors')
 const helmet = require('helmet')
 const morganDebug = require('morgan-debug')
 const W3CWebSocket = require('websocket').w3cwebsocket
+require('dotenv').config()
 
 let upstreamMessageCount = 0
 let upstreamConnectCount = 0
@@ -74,6 +75,8 @@ const startStreamClient = () => {
   upstreamConnectCount++
 
   log('Start Stream Client')
+  console.log(process.env?.ENDPOINT);
+  
   const client = new W3CWebSocket(process.env?.ENDPOINT || 'ws://localhost:1400')
 
   const destruct = () => {

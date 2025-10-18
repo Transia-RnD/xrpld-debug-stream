@@ -45,6 +45,9 @@ Environment variables:
 ```
   websocketd --port=1400 \
     sh -c "docker exec vnode1 tail -f /opt/ripple/log/debug.log"
+
+nohup websocketd --port=1400 \
+  sh -c "docker exec vnode1 tail -f /opt/ripple/log/debug.log" &
 ```
 
 3. Run this repository:
