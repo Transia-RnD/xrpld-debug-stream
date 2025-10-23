@@ -7,6 +7,7 @@ const bodyParser = require('body-parser')
 const cors = require('cors')
 const helmet = require('helmet')
 const morganDebug = require('morgan-debug')
+const addressCodec = require('ripple-address-codec')
 const W3CWebSocket = require('websocket').w3cwebsocket
 require('dotenv').config()
 
@@ -27,15 +28,15 @@ redis.on('ready', _ => log_redis('REDIS ready'))
 redis.on('close', _ => log_redis('REDIS disconnected'))
 redis.on('error', e => log_redis('Error', e))
 
-const tempStoreMsg = (batchHash, message) => {
+const tempStoreMsg = (type, hash, message) => {
   try {
-    const key = batchHash + '_' + new Date() / 1 + '_' + upstreamMessageCount
+    const key = hash + '_' + new Date() / 1 + '_' + upstreamMessageCount
     const exp = 60 * 30 // 60 seconds times 30 minutes
 
     // log_redis('set', key)
-    redis.set('msg:' + key, message, 'ex', exp)
-    redis.incr('batch:' + batchHash)
-    redis.expire('batch:' + batchHash, exp)
+    redis.set(`msg:${type}:` + key, message, 'ex', exp)
+    redis.incr(`${type}:` + hash)
+    redis.expire(`${type}:` + hash, exp)
   } catch (e) {
     log_redis('Error', e)
   }
@@ -45,8 +46,36 @@ const streamClientMessage = msg => {
   if (msg !== '') {
     if (msg.match(/reportConsensusStateChange/)) return
 
-    upstreamMessageCount++
+    upstreamMessageCount++    
+    
+    // Handle XRPL Account addresses (r-addresses)
+    const rAddrMatch = msg.match(/r[a-zA-Z0-9]{20,}/g)
+    // console.log(`rAddrMatch: ${rAddrMatch}`);
+    
+    
+    // Handle BatchTrace [ParentBatchId]
     const batchTraceMatch = msg.match(/BatchTrace\[([A-F0-9]{64})\]/g)
+    // console.log(`batchTraceMatch: ${batchTraceMatch}`);
+    
+    // Handle WAMR [TxId]
+    const wamrMatch = msg.match(/WasmTrace\[([A-F0-9]{64})\]/g)
+    // console.log(`wamrMatch: ${wamrMatch}`);
+
+    if (rAddrMatch) {
+      const uniqueAccounts = [...new Set(rAddrMatch)]
+
+      log('MSG for accounts', uniqueAccounts.join(', '))
+      uniqueAccounts.forEach(account => {
+        tempStoreMsg('account', account, msg)
+
+        expressWs.getWss().clients.forEach(c => {
+          if (c?.subscriptionType === 'account' && c?.account === account) {
+            c.send(msg)
+            c.messages++
+          }
+        })
+      })
+    }
 
     if (batchTraceMatch) {
       const uniqueBatches = [...new Set(batchTraceMatch.map(match => {
@@ -56,12 +85,35 @@ const streamClientMessage = msg => {
 
       log('MSG for batches', uniqueBatches.join(', '))
       uniqueBatches.forEach(batchHash => {
-        tempStoreMsg(batchHash, msg)
+        tempStoreMsg('batch', batchHash, msg)
 
         expressWs.getWss().clients.forEach(c => {
-          if (c?.subscriptionType === 'batch' && (!c?.batchHash || c?.batchHash === batchHash)) {
+          if (c?.subscriptionType === 'batch' && (!c?.hash || c?.hash === batchHash)) {
             c.send(msg)
-            c.batchMessages++
+            c.messages++
+          }
+        })
+      })
+    }
+
+    if (wamrMatch) {
+      const uniqueContracts = [...new Set(wamrMatch.map(match => {
+        const hashMatch = match.match(/WasmTrace\[([A-F0-9]{64})\]/)
+        return hashMatch ? hashMatch[1] : null
+      }).filter(Boolean))]
+
+      log('MSG for contracts', uniqueContracts.join(', '))
+      uniqueContracts.forEach(contractHash => {
+        tempStoreMsg('contract', contractHash, msg)
+
+        expressWs.getWss().clients.forEach(c => {
+          console.log(c?.subscriptionType);
+          console.log(c?.hash);
+          console.log(contractHash);
+          
+          if (c?.subscriptionType === 'contract' && (!c?.hash || c?.hash === contractHash)) {
+            c.send(msg)
+            c.messages++
           }
         })
       })
@@ -117,7 +169,7 @@ const startStreamClient = () => {
   client.onmessage = e => {
     if (typeof e.data === 'string') {
       if (e.data.match(/INSERT INTO AccountTransactions/)) {
-        // Ignore
+        console.log('Skipping AccountTransactions message')
         return
       }
 
@@ -172,8 +224,8 @@ app.ws('/batch', (ws, req) => {
   
     Object.assign(ws, {
       subscriptionType: 'batch',
-      batchHash: null, // null means listen to all batches
-      batchMessages: 0
+      hash: null, // null means listen to all batches
+      messages: 0
     })
 
     ws.on('message', () => {
@@ -207,8 +259,8 @@ app.ws('/batch/:hash([A-F0-9]{64})', (ws, req) => {
   
     Object.assign(ws, {
       subscriptionType: 'batch',
-      batchHash,
-      batchMessages: 0
+      hash: batchHash,
+      messages: 0
     })
 
     ws.on('message', () => {
@@ -229,9 +281,108 @@ app.ws('/batch/:hash([A-F0-9]{64})', (ws, req) => {
   }
 })
 
+// WebSocket endpoint for XRPL account addresses
+app.ws('/:account(r[a-zA-Z0-9]{20,})', (ws, req) => {
+  try {
+    const account = (req.params?.account || '').trim()
+
+    if (!addressCodec.isValidClassicAddress(account)) {
+      throw new Error('Invalid XRPL account address: ' + account)
+    }
+
+    log('WebSocket connection', account)
+  
+    Object.assign(ws, {
+      subscriptionType: 'account',
+      account,
+      messages: 0
+    })
+
+    ws.on('message', () => {
+      ws.send(account)
+    })
+
+  } catch (e) {
+    ws.send(JSON.stringify({
+      msg: e.message,
+      error: true
+    }))
+
+    log(e.message)
+
+    process.nextTick(() => {
+      ws.close(4000, e.message)
+    })
+  }
+})
+
+// WebSocket endpoint for all contract transactions
+app.ws('/contract', (ws, req) => {
+  try {
+    log('WebSocket connection for all contract transactions')
+  
+    Object.assign(ws, {
+      subscriptionType: 'contract',
+      hash: null, // null means listen to all contracts
+      messages: 0
+    })
+
+    ws.on('message', () => {
+      ws.send('contract_all')
+    })
+
+  } catch (e) {
+    ws.send(JSON.stringify({
+      msg: e.message,
+      error: true
+    }))
+
+    log(e.message)
+
+    process.nextTick(() => {
+      ws.close(4000, e.message)
+    })
+  }
+})
+
+// WebSocket endpoint for specific contract hash
+app.ws('/contract/:hash([A-F0-9]{64})', (ws, req) => {
+  try {
+    const contractHash = (req.params?.hash || '').trim().toUpperCase()
+
+    if (!contractHash.match(/^[A-F0-9]{64}$/)) {
+      throw new Error('Invalid contract hash: ' + contractHash)
+    }
+
+    log('WebSocket connection for contract', contractHash)
+  
+    Object.assign(ws, {
+      subscriptionType: 'contract',
+      hash: contractHash,
+      messages: 0
+    })
+
+    ws.on('message', () => {
+      ws.send(contractHash)
+    })
+
+  } catch (e) {
+    ws.send(JSON.stringify({
+      msg: e.message,
+      error: true
+    }))
+
+    log(e.message)
+
+    process.nextTick(() => {
+      ws.close(4000, e.message)
+    })
+  }
+})
+
 app.get('/', async (req, res) => {
   res.status(404).json({
-    msg: 'Connect using a WebSocket client to /batch for all batch transactions or /batch/{hash} for specific batch',
+    msg: 'Connect using a WebSocket client to /batch, /contract, or /{account} for all transactions, or /batch/{hash}, /contract/{hash}, or /{account} for specific items',
     error: true
   })
 })
@@ -242,11 +393,23 @@ app.get('/recent/batches', async (req, res) => {
   })
 })
 
+app.get('/recent/contracts', async (req, res) => {
+  return res.json({
+    contracts: (await redis.keys('contract:*')).map(k => k.slice(9))
+  })
+})
+
+app.get('/recent/accounts', async (req, res) => {
+  return res.json({
+    accounts: (await redis.keys('account:*')).map(k => k.slice(8))
+  })
+})
+
 app.get('/recent/batch/:hash([A-F0-9]{64})', async (req, res) => {
   const batchHash = req.params.hash.toUpperCase()
-  const logs = (await Promise.all((await redis.keys('msg:' + batchHash + '_*'))
+  const logs = (await Promise.all((await redis.keys('msg:batch:' + batchHash + '_*'))
     .map(async l => {
-      const m = l.slice(4).split('_')
+      const m = l.slice(10).split('_')
       return {
         timestamp: m[1],
         data: await redis.get(l)
@@ -266,6 +429,54 @@ app.get('/recent/batch/:hash([A-F0-9]{64})', async (req, res) => {
   })
 })
 
+app.get('/recent/contract/:hash([A-F0-9]{64})', async (req, res) => {
+  const contractHash = req.params.hash.toUpperCase()
+  const logs = (await Promise.all((await redis.keys('msg:contract:' + contractHash + '_*'))
+    .map(async l => {
+      const m = l.slice(13).split('_')
+      return {
+        timestamp: m[1],
+        data: await redis.get(l)
+      }
+    }))).reduce((a, b) => {
+      a[b.timestamp] = b.data
+      return a
+    }, {})
+
+  return res.json({
+    contract: contractHash,
+    messages: Number(await redis.get('contract:' + contractHash) || 0),
+    logs: Object.keys(logs).sort().reduce((a, b) => {
+      a[b] = logs[b]
+      return a
+    }, {})
+  })
+})
+
+app.get('/recent/:account(r[a-zA-Z0-9]{18,})', async (req, res) => {
+  const account = req.params.account
+  const logs = (await Promise.all((await redis.keys('msg:account:' + account + '_*'))
+    .map(async l => {
+      const m = l.slice(12).split('_')
+      return {
+        timestamp: m[1],
+        data: await redis.get(l)
+      }
+    }))).reduce((a, b) => {
+      a[b.timestamp] = b.data
+      return a
+    }, {})
+
+  return res.json({
+    account: account,
+    messages: Number(await redis.get('account:' + account) || 0),
+    logs: Object.keys(logs).sort().reduce((a, b) => {
+      a[b] = logs[b]
+      return a
+    }, {})
+  })
+})
+
 app.get('/status', async (req, res) => {
   res.json({
     upstreamMessages: upstreamMessageCount,
@@ -274,11 +485,11 @@ app.get('/status', async (req, res) => {
     subscriptions: [ ...expressWs.getWss().clients.values() ].map(c => {
       return {
         type: c?.subscriptionType,
-        batch: c?.batchHash || 'all',
-        messages: c?.batchMessages || 0
+        hash: c?.hash || 'all',
+        messages: c?.messages || 0
       }
     }).reduce((a, b) => {
-      const key = b.type + '_' + b.batch
+      const key = b.type + '_' + b.hash
       Object.assign(a, {
         [key]: {
           messages: (a[key]?.messages || 0) + b.messages,
@@ -301,6 +512,31 @@ app.get('/batch/:hash([A-F0-9]{64})',
   (req, res, next) => {
     req.url = '/'
     next()
+  },
+  express.static(__dirname + '/public', { index: 'client.html' }))
+
+app.get('/contract', 
+  (req, res, next) => {
+    req.url = '/'
+    next()
+  },
+  express.static(__dirname + '/public', { index: 'client.html' }))
+
+app.get('/contract/:hash([A-F0-9]{64})', 
+  (req, res, next) => {
+    req.url = '/'
+    next()
+  },
+  express.static(__dirname + '/public', { index: 'client.html' }))
+
+app.get('/:account(r[a-zA-Z0-9]{20,})', 
+  (req, res, next) => {
+    req.url = '/'
+    if (!addressCodec.isValidClassicAddress(req.params?.account || '')) {
+      next('route')
+    } else {
+      next()
+    }
   },
   express.static(__dirname + '/public', { index: 'client.html' }))
 

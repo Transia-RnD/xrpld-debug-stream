@@ -168,11 +168,13 @@ function connect() {
   }
   
   batchHash = hashInput || null
+
+  const host = '79.110.60.105'
   
   if (batchHash) {
-    endpoint = `ws://79.110.60.99:8080/batch/${batchHash}`
+    endpoint = `ws://${host}:8081/account/${batchHash}`
   } else {
-    endpoint = `ws://79.110.60.99:8080/batch`
+    endpoint = `ws://${host}:8081/contract`
   }
   
   updateBatchInfo()
